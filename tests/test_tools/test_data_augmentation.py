@@ -11,7 +11,9 @@ sys.path.append(str(project_root))
 from yolo.tools.data_augmentation import (
     AugmentationComposer,
     HorizontalFlip,
+    HSVJitter,
     Mosaic,
+    RandomAffine,
     VerticalFlip,
 )
 
@@ -62,10 +64,52 @@ def test_mosaic():
     mosaic = Mosaic(prob=1)  # Ensure mosaic is applied
     mosaic.set_parent(MockParent())
 
+    parent = MockParent()
+    mosaic.set_parent(parent)
     mosaic_img, mosaic_boxes = mosaic(img, boxes)
 
-    # Checks here would depend on the exact expected behavior of the mosaic function,
-    # such as dimensions and content of the output image and boxes.
-
-    assert mosaic_img.size == (100, 100), "Mosaic image size should be same"
+    # Mosaic emits the full 2x canvas (as in YOLOv5/v8); a following RandomAffine crops
+    # it back to base_size. Downscaling here instead would halve every object's resolution.
+    assert mosaic_img.size == (200, 200), "Mosaic should emit a 2x canvas"
+    assert parent.mosaic_border == (-50, -50), "Mosaic must flag the border for RandomAffine"
     assert len(mosaic_boxes) > 0, "Should have some bounding boxes"
+    assert (mosaic_boxes[:, 1:] >= 0).all() and (mosaic_boxes[:, 1:] <= 1).all(), "Boxes must stay normalized"
+
+
+def test_mosaic_then_affine_restores_base_size():
+    """The Mosaic -> RandomAffine pair must end up back at base_size."""
+    img = Image.new("RGB", (100, 100), color="green")
+    boxes = torch.tensor([[0, 0.25, 0.25, 0.75, 0.75]])
+
+    class MockParent:
+        base_size = 100
+        mosaic_border = (0, 0)
+
+        def get_more_data(self, num_images):
+            return [(img, boxes) for _ in range(num_images)]
+
+    parent = MockParent()
+    mosaic, affine = Mosaic(prob=1), RandomAffine(prob=1, degrees=0, translate=0.1, scale=0.5)
+    mosaic.set_parent(parent)
+    affine.set_parent(parent)
+
+    mosaic_img, mosaic_boxes = mosaic(img, boxes)
+    out_img, out_boxes = affine(mosaic_img, mosaic_boxes)
+
+    assert out_img.size == (100, 100), "RandomAffine should crop the mosaic back to base_size"
+    assert parent.mosaic_border == (0, 0), "Border must be reset after the crop is consumed"
+    if len(out_boxes):
+        assert (out_boxes[:, 3] > out_boxes[:, 1]).all(), "No degenerate boxes"
+        assert (out_boxes[:, 4] > out_boxes[:, 2]).all(), "No degenerate boxes"
+
+
+def test_hsv_jitter_preserves_geometry():
+    """HSV must change pixels but never touch boxes or image size."""
+    img = Image.new("RGB", (64, 48), color=(120, 90, 60))
+    boxes = torch.tensor([[0, 0.2, 0.2, 0.8, 0.8]])
+
+    jitter = HSVJitter(prob=1, hgain=0.015, sgain=0.7, vgain=0.4)
+    out_img, out_boxes = jitter(img, boxes.clone())
+
+    assert out_img.size == img.size, "HSV must not resize"
+    assert torch.equal(out_boxes, boxes), "HSV must not alter boxes"

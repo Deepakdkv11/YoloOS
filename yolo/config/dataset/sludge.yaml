@@ -1,0 +1,31 @@
+# Sludge detection - fixed-camera CCTV, 2 classes.
+#
+# Built by split_dataset.py (scene-based stratified split, seed search 400).
+# Layout under `path`, which is relative to the directory you LAUNCH training from
+# (the repo root, since you run `python yolo/lazy.py`):
+#
+#   data/custom/images/{train,val,test}/<n>.jpg
+#   data/custom/labels/{train,val,test}/<n>.txt
+#
+# Splits are NOT interchangeable with a random split of the same images: val and
+# test were built to contain zero near-duplicates of any training frame. Re-running
+# split_dataset.py with different arguments invalidates any comparison against runs
+# made on this one.
+#
+#   train 3493 frames   val 309   test 318
+#   cross-split near-duplicates: 0.0%
+#   day/night mix: 32.4% / 32.4% / 32.7% grayscale (overall 36.6%)
+
+path: data/custom
+train: train
+validation: val
+
+# The held-out test set lives in images/test. Point `validation` at `test` for the
+# ONE final evaluation, after every tuning decision is finished. Reading it earlier
+# turns it into a second val set and you lose your honest estimate.
+
+class_num: 2
+class_list: ['floatingsludge', 'sludge']
+
+# Local dataset - nothing to fetch.
+auto_download:

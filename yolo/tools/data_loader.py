@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 from queue import Empty, Queue
 from statistics import mean
@@ -17,6 +19,7 @@ from yolo.tools.data_augmentation import AugmentationComposer
 from yolo.tools.dataset_preparation import prepare_dataset
 from yolo.utils.dataset_utils import (
     create_image_metadata,
+    detect_label_format,
     locate_label_paths,
     scale_segmentation,
     tensorlize,
@@ -33,7 +36,18 @@ class YoloDataset(Dataset):
         self.dynamic_shape = getattr(data_cfg, "dynamic_shape", False)
         self.base_size = mean(self.image_size)
 
-        transforms = [eval(aug)(prob) for aug, prob in augment_cfg.items()]
+        # "auto" | "detect" | "segment"; resolved against the label files in filter_data().
+        self.label_format = getattr(data_cfg, "label_format", "auto")
+
+        # Each augmentation may be configured either as `Name: <prob>` (legacy) or as
+        # `Name: {prob: ..., <other kwargs>}`, which is needed for HSVJitter/RandomAffine.
+        transforms = []
+        for aug, params in augment_cfg.items():
+            aug_class = eval(aug)
+            if isinstance(params, Mapping):
+                transforms.append(aug_class(**params))
+            else:
+                transforms.append(aug_class(params))
         self.transform = AugmentationComposer(transforms, self.image_size, self.base_size)
         self.transform.get_more_data = self.get_more_data
         self.img_paths, self.bboxes, self.ratios = tensorlize(self.load_data(Path(dataset_cfg.path), phase_name))
@@ -49,7 +63,16 @@ class YoloDataset(Dataset):
         Returns:
             dict: The loaded data from the cache for the specified phase.
         """
-        cache_path = dataset_path / f"{phase_name}.pache"
+        # The cache stores already-decoded boxes, so it is only valid for the label format
+        # it was built with. Encoding the format in the filename means switching formats
+        # (or fixing a mis-detection) rebuilds the cache instead of silently reusing bad boxes.
+        cache_path = dataset_path / f"{phase_name}.{self.label_format}.pache"
+        legacy_cache = dataset_path / f"{phase_name}.pache"
+        if legacy_cache.exists() and not cache_path.exists():
+            logger.warning(
+                f":warning: Found a legacy cache at '{legacy_cache}' built before label-format "
+                "support. Ignoring it; delete it to silence this message."
+            )
 
         if not cache_path.exists():
             logger.info(f":factory: Generating {phase_name} cache")
@@ -97,6 +120,20 @@ class YoloDataset(Dataset):
         if data_type == "json":
             annotations_index, image_info_dict = create_image_metadata(labels_path)
 
+        # Resolve the .txt label layout once, up front, and say out loud which one we picked.
+        if data_type == "txt":
+            if self.label_format == "auto":
+                probe_dir = labels_path if not adjust_path else Path(labels_list[0]).parent
+                self.label_format = detect_label_format(probe_dir)
+                logger.info(
+                    f":mag: Auto-detected label format '{self.label_format}' for {phase_name} "
+                    f"({'<cls> <cx> <cy> <w> <h>' if self.label_format == 'detect' else '<cls> <x1> <y1> ... <xn> <yn>'})"
+                )
+            elif self.label_format not in ("detect", "segment"):
+                raise ValueError(
+                    f"task.data.label_format must be one of 'auto', 'detect', 'segment'; got {self.label_format!r}"
+                )
+
         data = []
         valid_inputs = 0
         for idx, image_name in enumerate(track(images_list, description="Filtering data")):
@@ -120,7 +157,8 @@ class YoloDataset(Dataset):
             else:
                 image_seg_annotations = []
 
-            labels = self.load_valid_labels(image_id, image_seg_annotations)
+            row_format = self.label_format if data_type == "txt" else "segment"
+            labels = self.load_valid_labels(image_id, image_seg_annotations, row_format)
             img_path = image_name if adjust_path else images_path / image_name
             if sort_image:
                 with Image.open(img_path) as img:
@@ -136,32 +174,63 @@ class YoloDataset(Dataset):
         logger.info(f"Recorded {valid_inputs}/{len(images_list)} valid inputs")
         return data
 
-    def load_valid_labels(self, label_path: str, seg_data_one_img: list) -> Union[Tensor, None]:
+    def load_valid_labels(self, label_path: str, seg_data_one_img: list, label_format: str = "segment") -> Tensor:
         """
-        Loads valid COCO style segmentation data (values between [0, 1]) and converts it to bounding box coordinates
-        by finding the minimum and maximum x and y values.
+        Converts one image's raw annotation rows into normalized xyxy boxes.
+
+        Two row layouts are supported:
+          - "segment": `<cls> <x1> <y1> ... <xn> <yn>` — a normalized polygon, collapsed to
+            its axis-aligned bounding box. This is what COCO json and this repo's own
+            data_conversion.py produce.
+          - "detect":  `<cls> <cx> <cy> <w> <h>` — the standard YOLO detection row emitted
+            by LabelImg, label-studio, CVAT and Roboflow.
 
         Parameters:
             label_path (str): The filepath to the label file containing annotation data.
-            seg_data_one_img (list): The actual list of annotations (in segmentation format)
+            seg_data_one_img (list): The actual list of annotation rows.
+            label_format (str): "segment" or "detect".
 
         Returns:
-            Tensor or None: A tensor of all valid bounding boxes if any are found; otherwise, None.
+            Tensor: (N, 5) of [cls, x_min, y_min, x_max, y_max], normalized. Empty if none valid.
         """
         bboxes = []
         for seg_data in seg_data_one_img:
             cls = seg_data[0]
-            points = np.array(seg_data[1:]).reshape(-1, 2).clip(0, 1)
+            values = seg_data[1:]
+
+            if label_format == "detect":
+                if len(values) != 4:
+                    logger.warning(
+                        f"Skipping malformed detection row in {label_path}: expected 4 values "
+                        f"after the class id, got {len(values)}."
+                    )
+                    continue
+                center_x, center_y, width, height = values
+                if width <= 0 or height <= 0:
+                    continue
+                x_min, y_min = center_x - width / 2, center_y - height / 2
+                x_max, y_max = center_x + width / 2, center_y + height / 2
+                bbox = torch.tensor(
+                    [cls, min(max(x_min, 0.0), 1.0), min(max(y_min, 0.0), 1.0),
+                     min(max(x_max, 0.0), 1.0), min(max(y_max, 0.0), 1.0)]
+                )
+                if bbox[3] > bbox[1] and bbox[4] > bbox[2]:
+                    bboxes.append(bbox)
+                continue
+
+            points = np.array(values).reshape(-1, 2).clip(0, 1)
             valid_points = points[(points >= 0) & (points <= 1)].reshape(-1, 2)
             if valid_points.size > 1:
                 bbox = torch.tensor([cls, *valid_points.min(axis=0), *valid_points.max(axis=0)])
                 bboxes.append(bbox)
 
         if bboxes:
-            return torch.stack(bboxes)
+            # Always float32: the polygon branch builds its tensor from float64 numpy
+            # scalars, so without this the two branches return different dtypes.
+            return torch.stack(bboxes).to(torch.float32)
         else:
             logger.warning(f"No valid BBox in {label_path}")
-            return torch.zeros((0, 5))
+            return torch.zeros((0, 5), dtype=torch.float32)
 
     def get_data(self, idx):
         img_path, bboxes = self.img_paths[idx], self.bboxes[idx]
@@ -198,7 +267,10 @@ class YoloDataset(Dataset):
         return len(self.bboxes)
 
 
-def collate_fn(batch: List[Tuple[Tensor, Tensor]]) -> Tuple[Tensor, List[Tensor]]:
+_MAX_BOX_WARNED = False
+
+
+def collate_fn(batch: List[Tuple[Tensor, Tensor]], max_bbox: int = 100) -> Tuple[Tensor, List[Tensor]]:
     """
     A collate function to handle batching of images and their corresponding targets.
 
@@ -206,20 +278,30 @@ def collate_fn(batch: List[Tuple[Tensor, Tensor]]) -> Tuple[Tensor, List[Tensor]
         batch (list of tuples): Each tuple contains:
             - image (Tensor): The image tensor.
             - labels (Tensor): The tensor of labels for the image.
+        max_bbox (int): Hard cap on ground-truth boxes kept per image. Anything beyond this
+            is dropped, so crowded scenes silently lose supervision. Raise it via
+            `task.data.max_bbox` if your images have more than 100 objects.
 
     Returns:
         Tuple[Tensor, List[Tensor]]: A tuple containing:
             - A tensor of batched images.
             - A list of tensors, each corresponding to bboxes for each image in the batch.
     """
+    global _MAX_BOX_WARNED
     batch_size = len(batch)
     target_sizes = [item[1].size(0) for item in batch]
-    # TODO: Improve readability of these process
-    # TODO: remove maxBbox or reduce loss function memory usage
-    batch_targets = torch.zeros(batch_size, min(max(target_sizes), 100), 5)
+
+    if max(target_sizes, default=0) > max_bbox and not _MAX_BOX_WARNED:
+        _MAX_BOX_WARNED = True
+        logger.warning(
+            f":warning: An image carries {max(target_sizes)} ground-truth boxes but max_bbox={max_bbox}; "
+            "the extras are being dropped. Increase task.data.max_bbox to keep them."
+        )
+
+    batch_targets = torch.zeros(batch_size, min(max(target_sizes, default=1), max_bbox), 5)
     batch_targets[:, :, 0] = -1
     for idx, target_size in enumerate(target_sizes):
-        batch_targets[idx, : min(target_size, 100)] = batch[idx][1][:100]
+        batch_targets[idx, : min(target_size, max_bbox)] = batch[idx][1][:max_bbox]
 
     batch_images, _, batch_reverse, batch_path = zip(*batch)
     batch_images = torch.stack(batch_images)
@@ -235,13 +317,41 @@ def create_dataloader(data_cfg: DataConfig, dataset_cfg: DatasetConfig, task: st
     if getattr(dataset_cfg, "auto_download", False):
         prepare_dataset(dataset_cfg, task)
     dataset = YoloDataset(data_cfg, dataset_cfg, task)
+    max_bbox = getattr(data_cfg, "max_bbox", 100)
+
+    # `shuffle` was present in the config but never forwarded to the DataLoader, so training
+    # always walked the dataset in the same (aspect-ratio-sorted) order every epoch.
+    # dynamic_shape deliberately relies on that ordering to batch similar shapes together,
+    # so shuffling stays off in that mode.
+    shuffle = bool(getattr(data_cfg, "shuffle", False)) and task == "train"
+    if shuffle and getattr(data_cfg, "dynamic_shape", False):
+        logger.warning(
+            ":warning: dynamic_shape batches images by aspect ratio, which requires a sorted "
+            "sampler. Disabling shuffle for this dataloader."
+        )
+        shuffle = False
+
+    # Dropping the ragged last batch keeps BatchNorm statistics stable, but only when
+    # there is more than one full batch to begin with: on a small dataset (say 30 images
+    # with batch_size=32) drop_last would discard *every* batch and train on nothing.
+    drop_last = task == "train" and len(dataset) >= 2 * data_cfg.batch_size
+    if task == "train" and not drop_last and len(dataset) < data_cfg.batch_size:
+        logger.warning(
+            f":warning: Only {len(dataset)} samples for a batch_size of {data_cfg.batch_size}; "
+            "every step will be a partial batch. Lower task.data.batch_size."
+        )
 
     return DataLoader(
         dataset,
         batch_size=data_cfg.batch_size,
         num_workers=data_cfg.cpu_num,
         pin_memory=data_cfg.pin_memory,
-        collate_fn=collate_fn,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        # Deliberately NOT persistent: workers are re-forked each epoch, which is what lets
+        # the CloseMosaic callback's mutation of transform.prob reach them.
+        persistent_workers=False,
+        collate_fn=partial(collate_fn, max_bbox=max_bbox),
     )
 
 

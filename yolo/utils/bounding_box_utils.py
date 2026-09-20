@@ -464,7 +464,15 @@ def bbox_nms(cls_dist: Tensor, bbox: Tensor, nms_cfg: NMSConfig, confidence: Opt
     valid_con = cls_dist[batch_idx, valid_grid, valid_cls]
     valid_box = bbox[batch_idx, valid_grid]
 
-    nms_idx = batched_nms(valid_box, valid_con, batch_idx + valid_cls * bbox.size(0), nms_cfg.min_iou)
+    # torchvision's batched_nms separates groups by shifting boxes by
+    # `group_idx * (max_coordinate + 1)` *in the dtype of the boxes*. Under the
+    # trainer's "16-mixed" precision these boxes are float16, whose integers are only
+    # exact up to 2048; past that the offsets collide and boxes from different
+    # images/classes get suppressed against each other (upstream issue #234).
+    # Running NMS in float32 costs nothing measurable and makes it exact.
+    nms_idx = batched_nms(
+        valid_box.float(), valid_con.float(), batch_idx + valid_cls * bbox.size(0), nms_cfg.min_iou
+    )
     predicts_nms = []
     for idx in range(cls_dist.size(0)):
         instance_idx = nms_idx[idx == batch_idx[nms_idx]]

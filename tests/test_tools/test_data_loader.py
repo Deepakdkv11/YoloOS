@@ -28,16 +28,62 @@ def test_create_dataloader_cache(train_cfg: Config):
 
 
 def test_training_data_loader_correctness(train_dataloader: DataLoader):
-    """Test that the training data loader produces correctly shaped data and metadata."""
+    """Test that the training data loader produces correctly shaped data and metadata.
+
+    Note: the training loader now honours `shuffle`, which it previously ignored, so the
+    batch order varies between epochs. This asserts on the *set* of paths rather than a
+    fixed sequence; see test_training_data_loader_shuffles for the ordering behaviour.
+    """
     batch_size, images, _, reverse_tensors, image_paths = next(iter(train_dataloader))
     assert batch_size == 2
     assert images.shape == (2, 3, 640, 640)
     assert reverse_tensors.shape == (2, 5)
-    expected_paths = [
+
+    known_paths = {
         Path("tests/data/images/train/000000050725.jpg"),
         Path("tests/data/images/train/000000167848.jpg"),
-    ]
-    assert list(image_paths) == list(expected_paths)
+        Path("tests/data/images/train/000000201517.jpg"),
+        Path("tests/data/images/train/000000206909.jpg"),
+        Path("tests/data/images/train/000000385508.jpg"),
+    }
+    assert set(image_paths) <= known_paths
+    assert len(set(image_paths)) == 2, "a batch must not repeat the same image"
+
+
+def test_training_data_loader_shuffles(train_cfg):
+    """`shuffle: True` in the config must actually reach the DataLoader.
+
+    It previously did not: `create_dataloader` never forwarded it, so every epoch walked
+    the dataset in identical order.
+    """
+    from torch.utils.data import RandomSampler
+
+    from yolo.tools.data_loader import create_dataloader
+
+    train_cfg.task.data.shuffle = True
+    train_cfg.task.data.batch_size = 2
+    train_cfg.task.data.cpu_num = 0
+    loader = create_dataloader(train_cfg.task.data, train_cfg.dataset, "train")
+
+    assert isinstance(loader.sampler, RandomSampler), "shuffle=True must yield a RandomSampler"
+
+    orders = []
+    for _ in range(5):
+        orders.append(tuple(p.name for *_, paths in loader for p in paths))
+    assert len(set(orders)) > 1, "batch order should vary between epochs when shuffling"
+
+
+def test_small_dataset_is_not_dropped_entirely(train_cfg):
+    """drop_last must not silently discard every batch on a small dataset."""
+    from yolo.tools.data_loader import create_dataloader
+
+    train_cfg.task.data.shuffle = False
+    train_cfg.task.data.cpu_num = 0
+    train_cfg.task.data.batch_size = 4  # mock train split has only 5 images
+    loader = create_dataloader(train_cfg.task.data, train_cfg.dataset, "train")
+
+    assert loader.drop_last is False, "drop_last should disengage when < 2 full batches"
+    assert len(list(loader)) > 0, "loader must yield at least one batch"
 
 
 def test_validation_data_loader_correctness(validation_dataloader: DataLoader):

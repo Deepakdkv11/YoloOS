@@ -38,6 +38,50 @@ def locate_label_paths(dataset_path: Path, phase_name: Path) -> Tuple[Path, Path
     return [], None
 
 
+def detect_label_format(labels_path: Path, sample_size: int = 200) -> str:
+    """Decide whether a directory of .txt labels is in detection or segmentation format.
+
+    This repo's .txt reader was written for *segmentation* labels, i.e.
+
+        <cls> <x1> <y1> <x2> <y2> ... <xn> <yn>      (normalized polygon)
+
+    which is NOT the format every common labelling tool exports by default. The standard
+    YOLO *detection* format is
+
+        <cls> <cx> <cy> <w> <h>                       (normalized, box center + size)
+
+    Feeding detection labels to the polygon reader silently produces garbage boxes rather
+    than an error: `0 0.5 0.5 0.2 0.4` is read as the pairs (0.5, 0.5) and (0.2, 0.4), so
+    the box becomes xyxy=(0.2, 0.4, 0.5, 0.5) instead of (0.4, 0.3, 0.6, 0.7).
+
+    Returns:
+        "detect" if every sampled row has exactly 5 fields, "segment" if any row has 7+
+        fields (a real polygon), and "detect" for an empty/unreadable sample.
+    """
+    label_files = sorted(Path(labels_path).glob("*.txt"))[:sample_size]
+    field_counts = set()
+    for label_file in label_files:
+        try:
+            with open(label_file, "r") as handle:
+                for line in handle:
+                    parts = line.strip().split()
+                    if parts:
+                        field_counts.add(len(parts))
+        except OSError:
+            continue
+
+    if not field_counts:
+        return "detect"
+    if max(field_counts) >= 7:
+        if 5 in field_counts:
+            logger.warning(
+                ":warning: Label directory mixes 5-field (detection) and 7+-field (polygon) rows. "
+                "Reading all of them as polygons. Set task.data.label_format explicitly if that is wrong."
+            )
+        return "segment"
+    return "detect"
+
+
 def create_image_metadata(labels_path: str) -> Tuple[Dict[str, List], Dict[str, Dict]]:
     """
     Create a dictionary containing image information and annotations indexed by image ID.

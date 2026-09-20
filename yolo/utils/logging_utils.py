@@ -21,9 +21,14 @@ import numpy as np
 import torch
 import wandb
 from lightning import LightningModule, Trainer, seed_everything
-from lightning.pytorch.callbacks import Callback, RichModelSummary, RichProgressBar
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint, RichModelSummary, RichProgressBar
 from lightning.pytorch.callbacks.progress.rich_progress import CustomProgress
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
+
+try:  # mlflow is optional - the repo must still run without it installed
+    from lightning.pytorch.loggers import MLFlowLogger
+except ImportError:  # pragma: no cover
+    MLFlowLogger = None
 from lightning.pytorch.utilities import rank_zero_only
 from omegaconf import ListConfig, OmegaConf
 from rich import get_console, reconfigure
@@ -33,12 +38,13 @@ from rich.table import Table
 from rich.text import Text
 from torch import Tensor
 from torch.nn import ModuleList
+from torchvision.transforms.functional import to_pil_image
 from typing_extensions import override
 
 from yolo.config.config import Config, YOLOLayer
 from yolo.model.yolo import YOLO
 from yolo.utils.logger import logger
-from yolo.utils.model_utils import EMA, GradientAccumulation
+from yolo.utils.model_utils import EMA, CloseMosaic, GradientAccumulation
 from yolo.utils.solver_utils import make_ap_table
 
 
@@ -106,7 +112,9 @@ class YOLORichProgressBar(RichProgressBar):
         epoch_descript = "[cyan]Train [white]|"
         batch_descript = "[green]Batch [white]|"
         metrics = self.get_metrics(trainer, pl_module)
-        metrics.pop("v_num")
+        # "v_num" is only injected when a Lightning logger is attached; popping it
+        # unconditionally crashes any run with use_wandb=False and use_tensorboard=False.
+        metrics.pop("v_num", None)
         for metrics_name, metrics_val in metrics.items():
             if "Loss_step" in metrics_name:
                 epoch_descript += f"{metrics_name.removesuffix('_step').split('/')[1]: ^9}|"
@@ -220,6 +228,38 @@ class YOLORichModelSummary(RichModelSummary):
         console.print(grid)
 
 
+def _mlflow_log_annotated(ml_logger, image, gt_boxes, pred_boxes, class_list, step):
+    """Log ground-truth and prediction images to MLflow with the boxes drawn on.
+
+    W&B renders boxes client-side from coordinates, which MLflow has no equivalent
+    for: attach only MLFlowLogger and the validation images silently stop appearing.
+    So burn the boxes into the pixels here and log a plain PNG. You lose W&B's
+    toggling and hover, but you keep the thing that matters - actually seeing what
+    the model predicted next to what it should have.
+    """
+    from yolo.tools.drawer import draw_bboxes
+
+    for tag, boxes in (("ground_truth", gt_boxes), ("prediction", pred_boxes)):
+        # Targets are padded to a fixed length with class_id -1; drawing those
+        # produces phantom boxes in the corner of every image.
+        if boxes is not None and len(boxes):
+            keep = [b for b in boxes if float(b[0]) >= 0]
+        else:
+            keep = []
+        annotated = draw_bboxes(image, [keep], idx2label=class_list) if keep else to_pil_image(image)
+        artifact = "validation/epoch_{:04d}_{}.png".format(step, tag)
+        try:
+            ml_logger.experiment.log_image(ml_logger.run_id, annotated, artifact)
+        except (AttributeError, TypeError):
+            # Older MlflowClient has no log_image; fall back to a plain artifact.
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as td:
+                local = Path(td) / Path(artifact).name
+                annotated.save(local)
+                ml_logger.experiment.log_artifact(ml_logger.run_id, str(local), "validation")
+
+
 class ImageLogger(Callback):
     def on_validation_batch_end(self, trainer: Trainer, pl_module, outputs, batch, batch_idx) -> None:
         if batch_idx != 0:
@@ -235,6 +275,15 @@ class ImageLogger(Callback):
                 logger.log_image("Input Image", images, step=step)
                 logger.log_image("Ground Truth", images, step=step, boxes=[log_bbox(gt_boxes)])
                 logger.log_image("Prediction", images, step=step, boxes=[log_bbox(pred_boxes)])
+            elif MLFlowLogger is not None and isinstance(logger, MLFlowLogger):
+                class_list = getattr(getattr(pl_module, "cfg", None), "dataset", None)
+                class_list = getattr(class_list, "class_list", None)
+                try:
+                    _mlflow_log_annotated(logger, images[0], gt_boxes, pred_boxes, class_list, step)
+                except Exception as err:  # never let logging kill a training run
+                    from yolo.utils.logger import logger as console_logger
+
+                    console_logger.warning(f"⚠️ MLflow image logging failed: {err}")
 
 
 def setup_logger(logger_name, quiet=False):
@@ -275,6 +324,25 @@ def setup(cfg: Config):
     if cfg.task.task == "train" and hasattr(cfg.task.data, "equivalent_batch_size"):
         progress.append(GradientAccumulation(data_cfg=cfg.task.data, scheduler_cfg=cfg.task.scheduler))
 
+    if cfg.task.task == "train":
+        close_mosaic = int(getattr(cfg.task, "close_mosaic", 0) or 0)
+        if close_mosaic > 0:
+            progress.append(CloseMosaic(epochs=close_mosaic))
+
+        # Without an explicit ModelCheckpoint, Lightning only keeps the *last* epoch. For a
+        # 300-epoch run that silently throws away the best model.
+        progress.append(
+            ModelCheckpoint(
+                dirpath=Path(save_path) / "checkpoints",
+                filename="best-{epoch:03d}-{map:.4f}",
+                monitor="map",
+                mode="max",
+                save_top_k=3,
+                save_last=True,
+                auto_insert_metric_name=False,
+            )
+        )
+
     if hasattr(cfg.task, "ema") and cfg.task.ema.enable:
         progress.append(EMA(cfg.task.ema.decay))
     if quiet:
@@ -289,6 +357,22 @@ def setup(cfg: Config):
     if cfg.use_wandb:
         wandb_cfg = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
         loggers.append(WandbLogger(project="YOLO", name=cfg.name, save_dir=save_path, id=None, config=wandb_cfg))
+    if getattr(cfg, "use_mlflow", False):
+        if MLFlowLogger is None:
+            logger.warning("⚠️ use_mlflow=True but mlflow is not installed - run `pip install mlflow`")
+        else:
+            import os
+
+            ml_logger = MLFlowLogger(
+                experiment_name=getattr(cfg, "mlflow_experiment", "sludge-detection"),
+                run_name=cfg.name,
+                # Unset falls back to a local ./mlruns directory, which is a fine
+                # way to try this out before the EC2 server exists.
+                tracking_uri=os.environ.get("MLFLOW_TRACKING_URI"),
+                log_model=True,
+            )
+            ml_logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
+            loggers.append(ml_logger)
 
     return progress, loggers, save_path
 

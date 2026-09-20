@@ -57,10 +57,13 @@ class DataConfig:
     pin_memory: bool
     cpu_num: int
     image_size: List[int]
-    data_augment: Dict[str, int]
+    data_augment: Dict[str, Any]
     source: Optional[Union[str, int]]
     dynamic_shape: Optional[bool]
     equivalent_batch_size: Optional[int] = 64
+    # "auto" | "detect" (<cls> <cx> <cy> <w> <h>) | "segment" (<cls> <x1> <y1> ... <xn> <yn>)
+    label_format: str = "auto"
+    max_bbox: int = 100
 
 
 @dataclass
@@ -136,6 +139,8 @@ class TrainConfig:
     scheduler: SchedulerConfig
     ema: EMAConfig
     validation: ValidationConfig
+    # Number of final epochs to train with Mosaic/MixUp disabled. 0 disables the behaviour.
+    close_mosaic: int = 10
 
 
 @dataclass
@@ -157,6 +162,7 @@ class Config:
     lucky_number: 10
     use_wandb: bool
     use_tensorboard: bool
+    use_mlflow: bool
 
     weight: Optional[str]
 

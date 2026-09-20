@@ -10,5 +10,8 @@ exist_ok: True
 lucky_number: 10
 use_wandb: True
 use_tensorboard: False
+# Self-hosted MLflow. Set MLFLOW_TRACKING_URI (and USERNAME/PASSWORD if the server
+# uses basic auth) in the environment; unset means MLflow's local ./mlruns folder.
+use_mlflow: False
 
 weight: True # Path to weight or True for auto, False for no pretrained weight

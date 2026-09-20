@@ -5,6 +5,10 @@ defaults:
 
 epoch: 500
 
+# Disable Mosaic/MixUp for the final N epochs so the model finishes on clean, in-domain
+# images (Ultralytics `close_mosaic`). Set to 0 to keep mosaic on for the whole run.
+close_mosaic: 10
+
 data:
   batch_size: 16
   equivalent_batch_size: 64
@@ -12,11 +16,35 @@ data:
   cpu_num: ${cpu_num}
   shuffle: True
   pin_memory: True
+
+  # How to read .txt label files:
+  #   auto    - inspect the files and decide (5 fields -> detect, 7+ -> segment)
+  #   detect  - <cls> <cx> <cy> <w> <h>          (LabelImg / CVAT / Roboflow / label-studio)
+  #   segment - <cls> <x1> <y1> ... <xn> <yn>    (polygon; what this repo's own converter emits)
+  label_format: auto
+
+  # Hard cap on ground-truth boxes per image. Raise it if your scenes are crowded.
+  max_bbox: 100
+
+  # Order matters. Mosaic emits a 2x canvas that RandomAffine crops back to image_size,
+  # so RandomAffine must come directly after Mosaic.
   data_augment:
-    Mosaic: 1
-    # MixUp: 1
-    # HorizontalFlip: 0.5
-    RandomCrop: 1
+    Mosaic: 1.0
+    RandomAffine:
+      prob: 1.0
+      degrees: 0.0        # rotation, +/- deg. Raise only if your camera is not level.
+      translate: 0.1
+      scale: 0.5          # strongest single knob in the v8 recipe
+      shear: 0.0
+      perspective: 0.0
+    HSVJitter:
+      prob: 1.0
+      hgain: 0.015
+      sgain: 0.7
+      vgain: 0.4
+    HorizontalFlip: 0.5
+    # MixUp: {prob: 0.15}     # v9-c/e only; leave off for small models and small datasets
+    # VerticalFlip: 0.5       # only if your objects genuinely appear upside down
     RemoveOutliers: 1e-8
 
 optimizer:

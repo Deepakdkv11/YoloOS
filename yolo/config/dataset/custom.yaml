@@ -1,0 +1,31 @@
+# Template for training on your own data.
+#
+# Expected layout (`path` is relative to where you launch training):
+#
+#   data/custom/
+#   ├── images/
+#   │   ├── train/   img_0001.jpg, img_0002.jpg, ...
+#   │   └── val/     img_9001.jpg, ...
+#   └── labels/
+#       ├── train/   img_0001.txt, img_0002.txt, ...   (one .txt per image, same stem)
+#       └── val/     img_9001.txt, ...
+#
+# Each .txt holds one object per line, normalized to [0, 1]:
+#
+#   <class_index> <center_x> <center_y> <width> <height>
+#
+# e.g. `0 0.512 0.334 0.220 0.410`. An image with no objects gets an empty .txt
+# (keep the file — it is a valid background/negative sample and improves precision).
+#
+# `class_index` is a 0-based index into `class_list` below, and the order must match
+# exactly what your labelling tool exported.
+
+path: data/custom
+train: train
+validation: val
+
+class_num: 3
+class_list: ['floc', 'foam', 'scum']
+
+# No auto-download for a local dataset.
+auto_download:

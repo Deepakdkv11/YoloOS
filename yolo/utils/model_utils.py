@@ -2,7 +2,7 @@ import os
 from copy import deepcopy
 from math import exp
 from pathlib import Path
-from typing import List, Optional, Type, Union
+from typing import List, Optional, Tuple, Type, Union
 
 import torch
 import torch.distributed as dist
@@ -73,7 +73,52 @@ class EMA(Callback):
         self.step += 1
         decay_factor = self.decay * (1 - exp(-self.step / self.tau))
         for key, param in pl_module.model.state_dict().items():
+            # Integer buffers (BatchNorm's num_batches_tracked, any registered index) must be
+            # copied, not interpolated: lerp on an int tensor either errors or silently
+            # truncates toward the stale value.
+            if not param.dtype.is_floating_point:
+                self.ema_state_dict[key] = param.detach().clone()
+                continue
             self.ema_state_dict[key] = lerp(param.detach(), self.ema_state_dict[key], decay_factor)
+
+
+class CloseMosaic(Callback):
+    """Turns Mosaic/MixUp off for the final `epochs` of training.
+
+    Mosaic is great for most of the schedule but its stitched, unrealistic composites
+    bias the box distribution. Every modern YOLO recipe disables it near the end so the
+    model finishes on clean, in-domain images. Without this the last epochs keep training
+    on mosaics and the final checkpoint is measurably worse on real frames.
+    """
+
+    def __init__(self, epochs: int = 10, transforms: Tuple[str, ...] = ("Mosaic", "MixUp")):
+        super().__init__()
+        self.epochs = epochs
+        self.transform_names = tuple(transforms)
+        self.closed = False
+        if epochs > 0:
+            logger.info(f":framed_picture: Will close {', '.join(self.transform_names)} for the last {epochs} epochs")
+
+    def on_train_epoch_start(self, trainer: "Trainer", pl_module: "LightningModule") -> None:
+        if self.closed or self.epochs <= 0 or trainer.max_epochs is None:
+            return
+        if trainer.current_epoch < trainer.max_epochs - self.epochs:
+            return
+
+        dataset = getattr(getattr(pl_module, "train_loader", None), "dataset", None)
+        composer = getattr(dataset, "transform", None)
+        if composer is None:
+            return
+
+        disabled = []
+        for transform in getattr(composer, "transforms", []):
+            if type(transform).__name__ in self.transform_names:
+                transform.prob = 0.0
+                disabled.append(type(transform).__name__)
+
+        self.closed = True
+        if disabled:
+            logger.info(f":framed_picture: Closed {', '.join(disabled)} at epoch {trainer.current_epoch}")
 
 
 class GradientAccumulation(Callback):
