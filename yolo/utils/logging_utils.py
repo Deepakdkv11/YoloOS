@@ -46,6 +46,7 @@ from yolo.model.yolo import YOLO
 from yolo.utils.logger import logger
 from yolo.utils.model_utils import EMA, CloseMosaic, GradientAccumulation
 from yolo.utils.solver_utils import make_ap_table
+from yolo.utils.ultralytics_report import UltralyticsStyleReport
 
 
 # TODO: should be moved to correct position
@@ -366,6 +367,14 @@ def setup(cfg: Config):
 
     if hasattr(cfg.task, "ema") and cfg.task.ema.enable:
         progress.append(EMA(cfg.task.ema.decay))
+
+    # Registered BEFORE the `quiet` early-return below: results.csv is the artefact
+    # analysis notebooks read, so it must be produced even on a quiet run. The console
+    # table is suppressed instead, via the quiet flag.
+    progress.append(
+        UltralyticsStyleReport(save_path, getattr(cfg.dataset, "class_list", None), quiet=quiet)
+    )
+
     if quiet:
         logger.setLevel(logging.ERROR)
         return progress, loggers, save_path

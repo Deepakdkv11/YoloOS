@@ -30,7 +30,12 @@ class ValidateModel(BaseModel):
             self.validation_cfg = self.cfg.task
         else:
             self.validation_cfg = self.cfg.task.validation
-        self.metric = MeanAveragePrecision(iou_type="bbox", box_format="xyxy", backend="faster_coco_eval")
+        self.metric = MeanAveragePrecision(
+            iou_type="bbox", box_format="xyxy", backend="faster_coco_eval",
+            # per-class mAP/mAR, for the Ultralytics-style validation table
+            class_metrics=True,
+        )
+        self.per_class_metrics = {}
         self.metric.warn_on_many_detections = False
         self.val_loader = create_dataloader(self.validation_cfg.data, self.cfg.dataset, self.validation_cfg.task)
         self.ema = self.model
@@ -55,7 +60,34 @@ class ValidateModel(BaseModel):
 
     def on_validation_epoch_end(self):
         epoch_metrics = self.metric.compute()
-        del epoch_metrics["classes"]
+        class_ids = epoch_metrics.pop("classes", None)
+
+        # class_metrics=True adds per-class TENSORS. log_dict wants scalars, so pull
+        # them out first, then stash them for UltralyticsStyleReport and log each one
+        # under its class name so it also shows up in W&B / MLflow.
+        per_class_raw = {k: epoch_metrics.pop(k) for k in ("map_per_class", "mar_100_per_class") if k in epoch_metrics}
+        self.per_class_metrics = {}
+        if class_ids is not None and per_class_raw:
+            names = getattr(self.cfg.dataset, "class_list", None) or []
+            ids = class_ids.tolist() if hasattr(class_ids, "tolist") else list(class_ids)
+            ids = ids if isinstance(ids, list) else [ids]
+            for pos, cls_id in enumerate(ids):
+                cls_id = int(cls_id)
+                name = names[cls_id] if 0 <= cls_id < len(names) else f"class_{cls_id}"
+                entry = {}
+                for raw_key, label in (("map_per_class", "mAP50-95"), ("mar_100_per_class", "mAR100")):
+                    values = per_class_raw.get(raw_key)
+                    if values is None:
+                        continue
+                    vals = values.tolist() if hasattr(values, "tolist") else values
+                    vals = vals if isinstance(vals, list) else [vals]
+                    if pos < len(vals):
+                        entry[label] = float(vals[pos])
+                if entry:
+                    self.per_class_metrics[name] = entry
+                    for label, value in entry.items():
+                        self.log(f"metrics/{label}({name})", value, sync_dist=True, rank_zero_only=True)
+
         self.log_dict(epoch_metrics, prog_bar=True, sync_dist=True, rank_zero_only=True)
         self.log_dict(
             {"PyCOCO/AP @ .5:.95": epoch_metrics["map"], "PyCOCO/AP @ .5": epoch_metrics["map_50"]},
