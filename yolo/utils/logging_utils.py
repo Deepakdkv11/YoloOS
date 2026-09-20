@@ -375,12 +375,11 @@ def setup(cfg: Config):
         UltralyticsStyleReport(save_path, getattr(cfg.dataset, "class_list", None), quiet=quiet)
     )
 
-    if quiet:
-        logger.setLevel(logging.ERROR)
-        return progress, loggers, save_path
-
-    progress.append(YOLORichProgressBar())
-    progress.append(YOLORichModelSummary())
+    # Experiment tracking is attached BEFORE the `quiet` early-return below. `quiet`
+    # means "no console noise" - the rich progress bar redraws its whole table every
+    # batch, which floods a notebook - it must NOT mean "no logging". Having it
+    # silently disable W&B/TensorBoard/MLflow throws away an entire run's metrics,
+    # and the only hint is a Lightning warning buried in the log.
     progress.append(ImageLogger())
     if cfg.use_tensorboard:
         loggers.append(TensorBoardLogger(log_graph="all", save_dir=save_path))
@@ -403,6 +402,15 @@ def setup(cfg: Config):
             )
             ml_logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True))
             loggers.append(ml_logger)
+
+    # Console-only extras. These are the genuinely noisy parts, so they are the only
+    # things `quiet` suppresses.
+    if quiet:
+        logger.setLevel(logging.ERROR)
+        return progress, loggers, save_path
+
+    progress.append(YOLORichProgressBar())
+    progress.append(YOLORichModelSummary())
 
     return progress, loggers, save_path
 
