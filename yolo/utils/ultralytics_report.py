@@ -51,7 +51,7 @@ class UltralyticsStyleReport(Callback):
         self.quiet = quiet
         self.csv_path = Path(save_path) / "results.csv"
         self.class_list = list(class_list) if class_list else []
-        self._header_written = self.csv_path.exists()
+        self._rows: List[Dict] = []
         self._counts: Optional[Dict[int, int]] = None
 
     # -- ground-truth counts, for the Instances column ----------------------
@@ -158,13 +158,24 @@ class UltralyticsStyleReport(Callback):
             if key.startswith("Loss/") and key.endswith("_epoch"):
                 row[f"train/{key[len('Loss/'):-len('_epoch')].lower()}"] = _scalar(value)
 
+        # Columns are NOT stable between epochs: per-class keys only appear once a class
+        # has predictions, and the loss keys arrive after the first train epoch. Appending
+        # with per-row fieldnames writes a header of one width and later rows of another,
+        # which makes the file unparseable ("expected 11 fields, saw 14"). So keep every
+        # row in memory and rewrite the whole file against the union of all keys. It is at
+        # most a few hundred rows; correctness matters far more than the write cost here.
+        self._rows.append(row)
+        fieldnames = ["epoch"]
+        for r in self._rows:
+            for key in r:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+
         try:
             self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.csv_path.open("a", newline="", encoding="utf-8") as fh:
-                writer = csv.DictWriter(fh, fieldnames=list(row.keys()))
-                if not self._header_written:
-                    writer.writeheader()
-                    self._header_written = True
-                writer.writerow(row)
+            with self.csv_path.open("w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames, restval="")
+                writer.writeheader()
+                writer.writerows(self._rows)
         except Exception as err:                       # logging must never kill a run
             logger.warning(f":warning: Could not write {self.csv_path}: {err}")
