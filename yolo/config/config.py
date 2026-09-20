@@ -141,6 +141,8 @@ class TrainConfig:
     validation: ValidationConfig
     # Number of final epochs to train with Mosaic/MixUp disabled. 0 disables the behaviour.
     close_mosaic: int = 10
+    # Stop early when val mAP has not improved for this many epochs. 0 disables it.
+    patience: int = 0
 
 
 @dataclass

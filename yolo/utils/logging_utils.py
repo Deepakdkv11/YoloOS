@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import wandb
 from lightning import LightningModule, Trainer, seed_everything
-from lightning.pytorch.callbacks import Callback, ModelCheckpoint, RichModelSummary, RichProgressBar
+from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint, RichModelSummary, RichProgressBar
 from lightning.pytorch.callbacks.progress.rich_progress import CustomProgress
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 
@@ -342,6 +342,27 @@ def setup(cfg: Config):
                 auto_insert_metric_name=False,
             )
         )
+
+        # Ultralytics `patience`: stop when val mAP has not improved for N epochs.
+        # Guarded on > 0 so the default stays "train the full schedule".
+        patience = int(getattr(cfg.task, "patience", 0) or 0)
+        if patience > 0:
+            if patience <= close_mosaic:
+                logger.warning(
+                    f":warning: patience ({patience}) <= close_mosaic ({close_mosaic}). Training may "
+                    "stop before mosaic is switched off, losing the clean-image phase where mAP "
+                    "usually jumps. Set patience well above close_mosaic."
+                )
+            progress.append(
+                EarlyStopping(
+                    monitor="map",
+                    mode="max",
+                    patience=patience,
+                    verbose=True,
+                    # "map" is produced by validation, not by the train epoch end.
+                    check_on_train_epoch_end=False,
+                )
+            )
 
     if hasattr(cfg.task, "ema") and cfg.task.ema.enable:
         progress.append(EMA(cfg.task.ema.decay))

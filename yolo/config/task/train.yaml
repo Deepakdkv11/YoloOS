@@ -9,6 +9,11 @@ epoch: 500
 # images (Ultralytics `close_mosaic`). Set to 0 to keep mosaic on for the whole run.
 close_mosaic: 10
 
+# Ultralytics `patience`. Stop when val mAP has not improved for N epochs; 0 = off.
+# Keep it comfortably ABOVE close_mosaic - mAP often jumps once mosaic switches off,
+# and stopping before that point throws away the best part of the run.
+patience: 0
+
 data:
   batch_size: 16
   equivalent_batch_size: 64
