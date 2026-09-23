@@ -79,6 +79,44 @@ Same checkpoint, same command, both splits:
    ±22 between splits, so any change worth less than ~10 points cannot be measured. Tuning
    against this signal fits noise.
 
+### Confidence threshold (val, 309 frames, 321 objects)
+
+Full sweep: `docs/results/conf_sweep_run1_val.json`
+
+The two classes want **opposite** thresholds, so no single global value serves both:
+
+| | `floatingsludge` | `sludge` |
+|---|---|---|
+| precision @ 0.05 | 0.945 | 0.689 |
+| precision @ 0.70 | 0.937 | 0.969 |
+| recall @ 0.05 | 0.895 | 0.879 |
+| recall @ 0.70 | 0.517 | 0.852 |
+| best F1 | **conf 0.05** | **conf 0.70** |
+
+`floatingsludge` holds ~0.95 precision at every threshold with false positives pinned at
+6-9, so raising the bar only costs recall. `sludge` sheds false positives 59 -> 4 as the
+bar rises while recall barely moves.
+
+| | global 0.05 | global 0.50 | **per-class 0.05 / 0.70** |
+|---|---|---|---|
+| precision | 0.807 | 0.937 | **0.956** |
+| recall | 0.888 | 0.788 | 0.875 |
+| false alarms | 68 | 17 | **13** |
+| missed | 36 | 68 | 40 |
+
+Per-class cuts false alarms 81% against the F2-optimal global setting for 4 lost
+detections out of 321. Not yet deployable - `rpi_infer.py` takes one `--conf`.
+
+**Recall caps at 0.888 at any threshold**: 36 of 321 objects are undetectable no matter
+how low the bar goes. That is a model/data limit, not a tuning one.
+
+**This revises finding 2.** `floatingsludge` looked like the weak class on mAP@50:95
+(48.74 vs 83.47), but at its own threshold it is the *stronger* one (F1 0.919 vs 0.907).
+mAP@50:95 averages IoU up to 0.95 and so is dominated by box tightness; `floatingsludge`
+is a thin horizontal layer where a few pixels of vertical error wrecks IoU while
+detection at IoU 0.5 stays reliable. The problem is box tightness, not detection - which
+points at label boundary consistency rather than at collecting more examples.
+
 ### Next
 
 - Inspect `floatingsludge` labels with `tools/visualize_predictions.py --sample worst` on **val**.
