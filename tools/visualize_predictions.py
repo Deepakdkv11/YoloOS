@@ -159,52 +159,86 @@ def score_frame(gt, preds, iou_thresh=0.5):
 def _font(size=16):
     for name in ("DejaVuSans.ttf", "arial.ttf"):
         try:
-            return ImageFont.truetype(name, size)
+            return ImageFont.truetype(name, int(size))
         except OSError:
             continue
     return ImageFont.load_default()
 
 
-def annotate(image, gt, preds, class_names, show_gt=True):
-    """Draw GT (green) and predictions (red) onto a copy of the image."""
-    canvas = image.convert("RGB").copy()
+def _tag(draw, x, y, text, fill, font, anchor_top=True):
+    """Draw text on an opaque plate so it stays readable over any background."""
+    box = draw.textbbox((x, y), text, font=font)
+    pad = 2
+    draw.rectangle([box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad], fill=(0, 0, 0))
+    draw.text((x, y), text, fill=fill, font=font)
+    return box[3] - box[1]
+
+
+def annotate(image, gt, preds, class_names, show_gt=True, target_width=None):
+    """Draw GT (green) and predictions (red), both labelled with their class.
+
+    If `target_width` is given the image is resized FIRST and the boxes scaled to match,
+    so label text stays legible. Annotating at full size and shrinking afterwards — which
+    is what a contact sheet would otherwise do — renders the text unreadable.
+    """
+    canvas = image.convert("RGB")
+    scale = 1.0
+    if target_width and canvas.width > target_width:
+        scale = target_width / canvas.width
+        canvas = canvas.resize(
+            (max(1, int(canvas.width * scale)), max(1, int(canvas.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    else:
+        canvas = canvas.copy()
+
     draw = ImageDraw.Draw(canvas)
-    width = max(2, canvas.width // 400)
-    font = _font(max(14, canvas.width // 60))
+    line = max(2, canvas.width // 320)
+    font = _font(max(11, canvas.width / 38))
 
     if show_gt:
         for cls, x1, y1, x2, y2 in gt:
-            draw.rectangle([x1, y1, x2, y2], outline=GT_COLOUR, width=width)
+            x1, y1, x2, y2 = (v * scale for v in (x1, y1, x2, y2))
+            draw.rectangle([x1, y1, x2, y2], outline=GT_COLOUR, width=line)
+            name = class_names[int(cls)] if int(cls) < len(class_names) else str(int(cls))
+            # GT label sits BELOW the box so it never collides with the prediction label.
+            _tag(draw, x1 + 2, min(canvas.height - font.size - 2, y2 + 2), name, GT_COLOUR, font)
 
     for x1, y1, x2, y2, score, cls in preds:
-        draw.rectangle([x1, y1, x2, y2], outline=PRED_COLOUR, width=width)
+        x1, y1, x2, y2 = (v * scale for v in (x1, y1, x2, y2))
+        draw.rectangle([x1, y1, x2, y2], outline=PRED_COLOUR, width=line)
         name = class_names[int(cls)] if int(cls) < len(class_names) else str(int(cls))
-        label = f"{name} {score:.2f}"
-        tx, ty = x1 + 2, max(0, y1 - font.size - 3)
-        box = draw.textbbox((tx, ty), label, font=font)
-        draw.rectangle(box, fill=(0, 0, 0))
-        draw.text((tx, ty), label, fill=(255, 255, 0), font=font)
+        _tag(draw, x1 + 2, max(0, y1 - font.size - 4), f"{name} {score:.2f}", PRED_COLOUR, font)
+
+    legend = _font(max(10, canvas.width / 46))
+    _tag(draw, 4, 4, "GT", GT_COLOUR, legend)
+    _tag(draw, 34, 4, "pred", PRED_COLOUR, legend)
 
     return canvas
 
 
-def build_grid(images, captions, cols, rows, cell=(480, 360), pad=6, bg=(24, 24, 28)):
-    """Tile annotated images into one contact sheet."""
+def build_grid(records, class_names, cols, rows, show_gt, cell=(520, 400), pad=6, bg=(24, 24, 28)):
+    """Tile frames into one contact sheet, annotating each at thumbnail size."""
     cw, ch = cell
-    caption_h = 22
+    caption_h = 24
     sheet = Image.new("RGB", (cols * (cw + pad) + pad, rows * (ch + caption_h + pad) + pad), bg)
     draw = ImageDraw.Draw(sheet)
     font = _font(14)
 
-    for index, (img, caption) in enumerate(zip(images, captions)):
+    for index, rec in enumerate(records):
         r, c = divmod(index, cols)
         if r >= rows:
             break
-        thumb = img.copy()
-        thumb.thumbnail((cw, ch), Image.Resampling.LANCZOS)
+        with Image.open(rec["path"]) as im:
+            thumb = annotate(im, rec["gt"], rec["preds"], class_names,
+                             show_gt=show_gt, target_width=cw)
+        if thumb.height > ch:
+            ratio = ch / thumb.height
+            thumb = thumb.resize((int(thumb.width * ratio), ch), Image.Resampling.LANCZOS)
         x = pad + c * (cw + pad) + (cw - thumb.width) // 2
         y = pad + r * (ch + caption_h + pad)
         sheet.paste(thumb, (x, y))
+        caption = f"{rec['path'].stem}  ok:{rec['matched']} miss:{rec['misses']} fp:{rec['false_alarms']}"
         draw.text((pad + c * (cw + pad), y + ch + 4), caption, fill=(210, 210, 210), font=font)
 
     return sheet
@@ -271,19 +305,17 @@ def main() -> None:
     out_images = args.out / "images"
     out_images.mkdir(parents=True, exist_ok=True)
 
-    rendered, captions = [], []
+    # Full-size annotated frames, one file each.
     for rec in records:
         with Image.open(rec["path"]) as im:
             canvas = annotate(im, rec["gt"], rec["preds"], args.classes, show_gt=not args.no_gt)
         canvas.save(out_images / f"{rec['path'].stem}.jpg", quality=92)
-        rendered.append(canvas)
-        captions.append(
-            f"{rec['path'].stem}  ok:{rec['matched']} miss:{rec['misses']} fp:{rec['false_alarms']}"
-        )
 
+    # Contact sheets re-annotate at thumbnail scale so the labels stay readable.
     sheets = 0
-    for start in range(0, len(rendered), per_sheet):
-        sheet = build_grid(rendered[start:start + per_sheet], captions[start:start + per_sheet], cols, rows)
+    for start in range(0, len(records), per_sheet):
+        sheet = build_grid(records[start:start + per_sheet], args.classes, cols, rows,
+                           show_gt=not args.no_gt)
         sheets += 1
         sheet.save(args.out / f"grid_{sheets:03d}.jpg", quality=92)
 
