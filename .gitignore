@@ -148,3 +148,8 @@ node_modules/
 
 # Not ignore image for demo
 !demo/images/*/*.png
+
+# Local analysis outputs (also kept in S3; docs/results/ holds what's worth versioning)
+viz_*/
+analysis_from_colab/
+deploy_out/
