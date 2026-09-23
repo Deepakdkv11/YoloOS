@@ -134,7 +134,17 @@ class YOLO(nn.Module):
         if isinstance(weights, Path):
             weights = torch.load(weights, map_location=torch.device("cpu"), weights_only=False)
         if "state_dict" in weights:
-            weights = {name.removeprefix("model.model."): key for name, key in weights["state_dict"].items()}
+            state_dict = weights["state_dict"]
+            # A Lightning checkpoint holds two copies of the network: the raw SGD weights
+            # under "model.model." and the exponential moving average under "ema.model.".
+            # The EMA copy is the one that gets validated and is normally the better model,
+            # so prefer it. Reading only the raw prefix silently loads the worse weights.
+            ema_keys = [key for key in state_dict if key.startswith("ema.model.")]
+            if ema_keys:
+                logger.info(":sparkles: Checkpoint contains EMA weights; loading those")
+                weights = {key.removeprefix("ema.model."): state_dict[key] for key in ema_keys}
+            else:
+                weights = {name.removeprefix("model.model."): key for name, key in state_dict.items()}
         model_state_dict = self.model.state_dict()
 
         # TODO1: autoload old version weight
