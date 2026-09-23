@@ -22,6 +22,7 @@ __all__ = [
     "MixUp",
     "RandomCrop",
     "HSVJitter",
+    "RandomBrightnessContrast",
     "RandomAffine",
 ]
 
@@ -212,6 +213,51 @@ class HSVJitter:
 
         merged = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
         return _to_pil(cv2.cvtColor(merged, cv2.COLOR_HSV2RGB)), boxes
+
+
+class RandomBrightnessContrast:
+    """Random contrast and brightness, to teach invariance to faint, low-contrast scenes.
+
+    HSVJitter scales the V channel multiplicatively, which moves the whole frame lighter
+    or darker but leaves the object-to-background *ratio* intact. It therefore does not
+    simulate a washed-out scene at all. Contrast is the separate axis:
+
+        out = (x - pivot) * contrast_gain + pivot + brightness_shift
+
+    With `contrast_gain < 1` pixel values are pulled toward the mean, which is exactly
+    what a faint sludge layer against near-clear liquid looks like. Training on
+    synthetically faded copies of your clear frames is the cheapest way to cover a
+    condition you have few real examples of.
+
+    Args:
+        prob: probability of applying.
+        contrast: gain is drawn from [1 - contrast, 1 + contrast]. 0.5 spans half to
+            1.5x contrast, which comfortably covers a washed-out frame.
+        brightness: shift as a fraction of full scale, drawn from [-b, +b].
+        pivot: "mean" pivots on the frame's own mean luminance (preserves overall
+            exposure while changing contrast); "mid" pivots on 127.5.
+    """
+
+    def __init__(self, prob: float = 0.5, contrast: float = 0.4, brightness: float = 0.15,
+                 pivot: str = "mean"):
+        self.prob = prob
+        self.contrast = contrast
+        self.brightness = brightness
+        if pivot not in ("mean", "mid"):
+            raise ValueError(f"pivot must be 'mean' or 'mid', got {pivot!r}")
+        self.pivot = pivot
+
+    def __call__(self, image, boxes):
+        if torch.rand(1) >= self.prob or not (self.contrast or self.brightness):
+            return image, boxes
+
+        array = _to_numpy(image).astype(np.float32)
+        gain = float(np.random.uniform(1 - self.contrast, 1 + self.contrast))
+        shift = float(np.random.uniform(-self.brightness, self.brightness)) * 255.0
+        centre = array.mean() if self.pivot == "mean" else 127.5
+
+        array = (array - centre) * gain + centre + shift
+        return _to_pil(np.clip(array, 0, 255).astype(np.uint8)), boxes
 
 
 class RandomAffine:

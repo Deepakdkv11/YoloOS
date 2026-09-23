@@ -47,6 +47,14 @@ data:
       hgain: 0.015
       sgain: 0.7
       vgain: 0.4
+    # Targets the observed failure mode: faint, low-contrast sludge in evening light.
+    # HSVJitter scales V multiplicatively, which dims the whole frame but leaves the
+    # object-to-background ratio intact, so it does NOT cover this. contrast: 0.5 spans
+    # 0.5x to 1.5x, turning clear frames into synthetically faded ones.
+    RandomBrightnessContrast:
+      prob: 0.5
+      contrast: 0.5
+      brightness: 0.15
     HorizontalFlip: 0.5
     # MixUp: {prob: 0.15}     # v9-c/e only; leave off for small models and small datasets
     # VerticalFlip: 0.5       # only if your objects genuinely appear upside down
