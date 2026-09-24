@@ -6,9 +6,10 @@ Bootstrap a labelled dataset: run a model you already have over unlabelled image
 write YOLO-format `.txt` labels, and hand them to a human to fix. Correcting boxes is
 several times faster than drawing them from scratch.
 
-Backends (chosen by file extension):
+Backends (chosen by file extension, override with --backend):
   *.pt   via Ultralytics  - your existing YOLOv8/v9/v11 model
   *.onnx via onnxruntime  - a model exported by tools/export_edge.py from THIS repo
+  *.ckpt via torch        - a training checkpoint from THIS repo (uses the EMA weights)
 
 Why both: once you have trained an MIT model here, you can relabel the next batch with
 it and drop the Ultralytics dependency entirely. That loop gets faster each round.
@@ -113,6 +114,33 @@ class OnnxBackend:
         ]
 
 
+class CheckpointAdapter:
+    """Wraps visualize_predictions.CheckpointBackend in this module's backend interface.
+
+    That backend takes a PIL image and returns numeric class ids; autolabel works from
+    paths and class names, so translate between the two rather than duplicating the
+    model-loading logic.
+    """
+
+    def __init__(self, model_path: Path, model_cfg: str, class_names, image_size):
+        from tools.visualize_predictions import CheckpointBackend
+
+        self.names = list(class_names)
+        self.backend = CheckpointBackend(model_path, model_cfg, len(self.names), image_size)
+        print(f"Checkpoint backend | {len(self.names)} classes | input={tuple(image_size)} | EMA weights")
+
+    def class_names(self):
+        return list(self.names)
+
+    def predict(self, image_path: Path, conf: float, iou: float):
+        with Image.open(image_path) as image:
+            detections = self.backend(image.convert("RGB"), conf, iou)
+        return [
+            (self.names[int(cls_id)], float(score), float(x1), float(y1), float(x2), float(y2))
+            for x1, y1, x2, y2, score, cls_id in detections
+        ]
+
+
 # ----------------------------------------------------------------------------------
 def build_class_map(source_names, target_classes, explicit_map):
     """Map a source class NAME to a target class INDEX. Unmapped classes are dropped."""
@@ -135,7 +163,7 @@ def build_class_map(source_names, target_classes, explicit_map):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", type=Path, required=True, help=".pt (Ultralytics) or .onnx (this repo)")
+    parser.add_argument("--model", type=Path, required=True, help=".pt (Ultralytics), .onnx or .ckpt (this repo)")
     parser.add_argument("--images", type=Path, required=True, help="directory of unlabelled images")
     parser.add_argument("--out", type=Path, required=True, help="dataset root, e.g. data/custom")
     parser.add_argument("--split", default="train", choices=["train", "val"])
@@ -145,6 +173,11 @@ def parse_args():
     parser.add_argument("--conf", type=float, default=0.35)
     parser.add_argument("--iou", type=float, default=0.5)
     parser.add_argument("--imgsz", type=int, default=640, help="Ultralytics inference size")
+    parser.add_argument("--backend", choices=["auto", "onnx", "checkpoint", "ultralytics"], default="auto",
+                        help="override backend detection (.onnx->onnx, .ckpt->checkpoint, else ultralytics)")
+    parser.add_argument("--model-cfg", default="v9-s", help="model config name (checkpoint backend only)")
+    parser.add_argument("--image-size", type=int, nargs=2, default=[640, 640],
+                        help="inference size for the checkpoint backend; match what you trained at")
     parser.add_argument("--copy-images", action="store_true", help="copy images into <out>/images/<split>/")
     parser.add_argument("--review-below", type=float, default=0.6,
                         help="flag images whose best detection scores below this, for priority review")
@@ -161,8 +194,16 @@ def main() -> None:
     if not images:
         raise SystemExit(f"No images found under {args.images}")
 
-    if args.model.suffix.lower() == ".onnx":
+    suffix = args.model.suffix.lower()
+    kind = args.backend
+    if kind == "auto":
+        # .ckpt is a Lightning checkpoint from THIS repo; .pt is an Ultralytics model.
+        kind = {".onnx": "onnx", ".ckpt": "checkpoint"}.get(suffix, "ultralytics")
+
+    if kind == "onnx":
         backend = OnnxBackend(args.model, args.classes)
+    elif kind == "checkpoint":
+        backend = CheckpointAdapter(args.model, args.model_cfg, args.classes, args.image_size)
     else:
         backend = UltralyticsBackend(args.model, args.imgsz)
 
