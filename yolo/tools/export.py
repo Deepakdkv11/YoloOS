@@ -188,6 +188,51 @@ def export_onnx(
     return output_path
 
 
+@torch.no_grad()
+def export_torchscript(
+    cfg,
+    weight_path: Optional[Path],
+    output_path: Path,
+    prefer_ema: bool = True,
+    optimize_for_inference: bool = True,
+) -> Path:
+    """Export the same deploy graph as TorchScript, for people who would rather not use ONNX.
+
+    A TorchScript archive carries the graph AND the weights, so `torch.jit.load` needs none
+    of this repo's code: no YAML parsing, no module construction, no auxiliary-branch
+    surgery. That is the part that makes every CLI invocation reprint "Building YOLO".
+
+    Note this is NOT the same as `torch.save(model)`. Pickling an nn.Module stores a
+    reference to the class, so loading it requires the exact same package layout to be
+    importable; move or rename a module and the file stops working. TorchScript is
+    self-contained.
+    """
+    model = build_deploy_model(cfg, weight_path, prefer_ema=prefer_ema)
+
+    width, height = cfg.image_size
+    dummy = torch.zeros(1, 3, height, width)
+
+    scripted = torch.jit.trace(model, dummy, strict=False)
+    if optimize_for_inference:
+        # freeze() inlines the parameters into the graph, which is what makes the archive
+        # self-contained. NOTE: torch.jit.optimize_for_inference() is deliberately NOT
+        # applied - on torch 2.7 it emits a graph that torch.jit.load cannot read back
+        # ("required keyword attribute 'value' is undefined"), and the resulting file is
+        # a few hundred KB because the weights are gone.
+        scripted = torch.jit.freeze(scripted.eval())
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Store the input size so a loader can recover it without being told.
+    torch.jit.save(scripted, str(output_path), _extra_files={"image_size": f"{width},{height}"})
+
+    boxes, scores = model(dummy)
+    logger.info(f":package: Graph outputs: boxes {tuple(boxes.shape)}, scores {tuple(scores.shape)}")
+    logger.info(f":inbox_tray: TorchScript saved to {output_path} "
+                f"({output_path.stat().st_size / 1e6:.1f} MB)")
+    return output_path
+
+
 def _try_simplify(onnx_path: Path) -> None:
     """Run onnx-simplifier if present. Optional, but it folds a lot of reshape noise."""
     try:

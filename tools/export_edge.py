@@ -26,7 +26,7 @@ from omegaconf import OmegaConf
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from yolo.tools.export import export_onnx  # noqa: E402
+from yolo.tools.export import export_onnx, export_torchscript  # noqa: E402
 from yolo.tools.quantize import preprocess, quantize_static_int8  # noqa: E402
 from yolo.utils.logger import logger  # noqa: E402
 
@@ -102,10 +102,18 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=Path("deploy_out"))
     parser.add_argument("--no-ema", action="store_true", help="export raw weights instead of the EMA copy")
     parser.add_argument("--skip-int8", action="store_true")
+    parser.add_argument("--format", choices=["onnx", "torchscript", "both"], default="onnx",
+                        help="torchscript avoids ONNX entirely but cannot be INT8-quantised here")
     args = parser.parse_args()
 
     cfg = build_cfg(args.model, args.classes, args.image_size)
     args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.format in ("torchscript", "both"):
+        export_torchscript(cfg, args.checkpoint, args.out_dir / "model.torchscript",
+                           prefer_ema=not args.no_ema)
+        if args.format == "torchscript":
+            return
 
     fp32_path = args.out_dir / "model_fp32.onnx"
     export_onnx(cfg, args.checkpoint, fp32_path, prefer_ema=not args.no_ema)

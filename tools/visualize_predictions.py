@@ -72,6 +72,47 @@ class OnnxBackend:
         return postprocess(boxes, scores, scale, pad_x, pad_y, conf, iou)
 
 
+class TorchScriptBackend:
+    """Runs a TorchScript archive exported by tools/export_edge.py --format torchscript.
+
+    Self-contained: torch.jit.load needs none of this repo's model code, so there is no
+    YAML parsing or module construction on startup.
+    """
+
+    def __init__(self, path: Path, class_names, image_size=None):
+        import torch
+
+        self.torch = torch
+        extra = {"image_size": ""}
+        self.model = torch.jit.load(str(path), map_location="cpu", _extra_files=extra)
+        self.model.eval()
+
+        stored = extra.get("image_size") or b""
+        if isinstance(stored, bytes):
+            stored = stored.decode() or ""
+        if stored:
+            w, h = (int(v) for v in stored.split(","))
+            self.image_size = (w, h)
+        elif image_size:
+            self.image_size = tuple(image_size)
+        else:
+            raise SystemExit("TorchScript file carries no image_size; pass --image-size")
+
+        self.names = list(class_names)
+        print(f"TorchScript backend | {len(self.names)} classes | input={self.image_size}")
+
+    def class_names(self):
+        return list(self.names)
+
+    def __call__(self, image: Image.Image, conf: float, iou: float):
+        from deploy.rpi_infer import postprocess, preprocess
+
+        tensor, scale, pad_x, pad_y = preprocess(image, self.image_size)
+        with self.torch.no_grad():
+            boxes, scores = self.model(self.torch.from_numpy(tensor))
+        return postprocess(boxes.numpy(), scores.numpy(), scale, pad_x, pad_y, conf, iou)
+
+
 class CheckpointBackend:
     """Runs a Lightning .ckpt directly, using the same deploy graph the exporter builds."""
 
@@ -270,8 +311,11 @@ def main() -> None:
     if not images:
         raise SystemExit(f"No images under {args.images}")
 
-    if args.model.suffix.lower() == ".onnx":
+    suffix = args.model.suffix.lower()
+    if suffix == ".onnx":
         backend = OnnxBackend(args.model)
+    elif suffix in (".torchscript", ".ts"):
+        backend = TorchScriptBackend(args.model, args.classes, args.image_size)
     else:
         backend = CheckpointBackend(args.model, args.model_cfg, len(args.classes), args.image_size)
 
