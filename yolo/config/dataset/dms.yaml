@@ -1,0 +1,9 @@
+# Driver monitoring - 4 classes
+path: data/dms_v1
+train: train
+validation: val
+
+class_num: 4
+class_list: ['face', 'phone', 'hold_phone', 'cigarette']
+
+auto_download:
